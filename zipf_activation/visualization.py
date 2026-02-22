@@ -8,7 +8,6 @@ import seaborn as sns
 from pathlib import Path
 
 from .config import OutputConfig
-from .fitting import PowerLawFitResult
 
 
 def _save_fig(fig: plt.Figure, path: Path, config: OutputConfig) -> None:
@@ -20,11 +19,15 @@ def _save_fig(fig: plt.Figure, path: Path, config: OutputConfig) -> None:
 
 
 # -----------------------------------------------------------------------
-# 1. Rank-frequency log-log plot
+# 1. Rank-frequency log-log plot (with OLS fit line)
 # -----------------------------------------------------------------------
 def plot_rank_frequency(
     values: np.ndarray,
-    fit_result: PowerLawFitResult,
+    layer_name: str,
+    metric_name: str,
+    slope: float,
+    intercept: float,
+    r_squared: float,
     output_path: Path,
     config: OutputConfig,
 ) -> None:
@@ -36,20 +39,18 @@ def plot_rank_frequency(
     ranks = np.arange(1, len(sorted_vals) + 1)
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    # Plot every k-th point for speed when N is large
     step = max(1, len(ranks) // 10_000)
     ax.loglog(ranks[::step], sorted_vals[::step], ".", markersize=1, alpha=0.4, label="Data")
 
-    # Overlay power law fit line from log-log regression
-    if fit_result.log_log_r_squared > 0:
-        fit_line = np.exp(fit_result.log_log_intercept) * ranks.astype(float) ** fit_result.log_log_slope
+    # Overlay OLS fit line
+    if r_squared > 0:
+        fit_line = np.exp(intercept) * ranks.astype(float) ** slope
         ax.loglog(ranks[::step], fit_line[::step], "r-", linewidth=1.5,
-                  label=f"Fit (slope={fit_result.log_log_slope:.2f}, R²={fit_result.log_log_r_squared:.3f})")
+                  label=f"OLS fit (slope={slope:.3f}, R2={r_squared:.3f})")
 
     ax.set_xlabel("Rank", fontsize=12)
     ax.set_ylabel("Value", fontsize=12)
-    title = f"{fit_result.layer_name} / {fit_result.metric_name}"
-    ax.set_title(title, fontsize=14)
+    ax.set_title(f"{layer_name} / {metric_name}", fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
@@ -88,46 +89,17 @@ def plot_multi_layer_comparison(
 
 
 # -----------------------------------------------------------------------
-# 3. Exponent dashboard (heatmap)
+# 3. Slope dashboard (heatmap)
 # -----------------------------------------------------------------------
-def plot_exponent_dashboard(
-    fit_results: dict[str, dict[str, PowerLawFitResult]],
-    output_path: Path,
-    config: OutputConfig,
-) -> None:
-    """Heatmap of alpha exponents across (layer, metric)."""
-    layer_names = sorted(fit_results.keys())
-    metric_names: list[str] = []
-    for lr in fit_results.values():
-        for mn in lr:
-            if mn not in metric_names:
-                metric_names.append(mn)
-
-    data = np.full((len(metric_names), len(layer_names)), np.nan)
-    for j, layer in enumerate(layer_names):
-        for i, metric in enumerate(metric_names):
-            if metric in fit_results[layer]:
-                data[i, j] = fit_results[layer][metric].alpha
-
-    fig, ax = plt.subplots(figsize=(max(8, len(layer_names) * 2), max(6, len(metric_names) * 0.5)))
-    sns.heatmap(data, annot=True, fmt=".2f", xticklabels=layer_names,
-                yticklabels=metric_names, cmap="YlOrRd", ax=ax)
-    ax.set_title("Power Law Exponent (alpha) by Layer and Metric", fontsize=14)
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("Metric")
-
-    _save_fig(fig, output_path, config)
-
-
 def plot_slope_dashboard(
-    fit_results: dict[str, dict[str, PowerLawFitResult]],
+    slopes: dict[str, dict[str, tuple[float, float, float]]],
     output_path: Path,
     config: OutputConfig,
 ) -> None:
     """Heatmap of log-log slopes across (layer, metric)."""
-    layer_names = sorted(fit_results.keys())
+    layer_names = sorted(slopes.keys())
     metric_names: list[str] = []
-    for lr in fit_results.values():
+    for lr in slopes.values():
         for mn in lr:
             if mn not in metric_names:
                 metric_names.append(mn)
@@ -135,11 +107,11 @@ def plot_slope_dashboard(
     data = np.full((len(metric_names), len(layer_names)), np.nan)
     for j, layer in enumerate(layer_names):
         for i, metric in enumerate(metric_names):
-            if metric in fit_results[layer]:
-                data[i, j] = fit_results[layer][metric].log_log_slope
+            if metric in slopes[layer]:
+                data[i, j] = slopes[layer][metric][0]  # slope
 
     fig, ax = plt.subplots(figsize=(max(8, len(layer_names) * 2), max(6, len(metric_names) * 0.5)))
-    sns.heatmap(data, annot=True, fmt=".2f", xticklabels=layer_names,
+    sns.heatmap(data, annot=True, fmt=".3f", xticklabels=layer_names,
                 yticklabels=metric_names, cmap="coolwarm", center=0, ax=ax)
     ax.set_title("Log-Log Slope by Layer and Metric", fontsize=14)
     ax.set_xlabel("Layer")
@@ -149,15 +121,16 @@ def plot_slope_dashboard(
 
 
 # -----------------------------------------------------------------------
-# 4. Distribution comparison (CCDF)
+# 4. CCDF plot
 # -----------------------------------------------------------------------
-def plot_distribution_comparison(
+def plot_ccdf(
     values: np.ndarray,
-    fit_result: PowerLawFitResult,
+    layer_name: str,
+    metric_name: str,
     output_path: Path,
     config: OutputConfig,
 ) -> None:
-    """Empirical CCDF with annotation of fit quality."""
+    """Empirical complementary CDF on log-log axes."""
     abs_values = np.sort(np.abs(values))[::-1]
     abs_values = abs_values[abs_values > 0]
     if len(abs_values) < 10:
@@ -169,27 +142,9 @@ def plot_distribution_comparison(
     step = max(1, len(abs_values) // 10_000)
     ax.loglog(abs_values[::step], ccdf[::step], ".", markersize=1, alpha=0.4, label="Empirical CCDF")
 
-    # Annotations
-    text_lines = [
-        f"alpha = {fit_result.alpha:.2f} (Clauset)",
-        f"xmin = {fit_result.xmin:.4g}",
-        f"KS = {fit_result.ks_statistic:.4f}",
-        f"n_tail = {fit_result.n_tail}",
-        f"slope = {fit_result.log_log_slope:.2f} (OLS)",
-        f"R² = {fit_result.log_log_r_squared:.3f}",
-    ]
-    for dist, comp in fit_result.comparisons.items():
-        r, p = comp["R"], comp["p"]
-        text_lines.append(f"vs {dist}: R={r:.2f}, p={p:.3f}")
-
-    ax.text(0.02, 0.02, "\n".join(text_lines), transform=ax.transAxes,
-            fontsize=8, verticalalignment="bottom", fontfamily="monospace",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
-
     ax.set_xlabel("Value", fontsize=12)
     ax.set_ylabel("P(X >= x)", fontsize=12)
-    title = f"CCDF: {fit_result.layer_name} / {fit_result.metric_name}"
-    ax.set_title(title, fontsize=14)
+    ax.set_title(f"CCDF: {layer_name} / {metric_name}", fontsize=14)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
@@ -197,29 +152,37 @@ def plot_distribution_comparison(
 
 
 # -----------------------------------------------------------------------
-# 5. Channel-wise heatmap
+# 5. Channel-wise rank-frequency (overlay sampled channels)
 # -----------------------------------------------------------------------
-def plot_channel_heatmap(
-    channel_fit_results: dict[str, list[PowerLawFitResult]],
+def plot_channel_rank_frequency(
+    channel_data: np.ndarray,
+    layer_name: str,
     output_path: Path,
     config: OutputConfig,
+    max_channels_to_plot: int = 16,
 ) -> None:
-    """Heatmap of alpha exponents across sampled channels and layers."""
-    layer_names = sorted(channel_fit_results.keys())
-    if not layer_names:
-        return
+    """Overlay rank-frequency curves for a subset of sampled channels."""
+    n_samples, n_channels = channel_data.shape
+    # Pick evenly spaced channels to avoid clutter
+    indices = np.linspace(0, n_channels - 1, min(max_channels_to_plot, n_channels), dtype=int)
 
-    n_channels = len(channel_fit_results[layer_names[0]])
-    data = np.full((n_channels, len(layer_names)), np.nan)
+    fig, ax = plt.subplots(figsize=(10, 7))
+    colors = plt.cm.tab20(np.linspace(0, 1, len(indices)))
 
-    for j, layer in enumerate(layer_names):
-        for i, fr in enumerate(channel_fit_results[layer]):
-            data[i, j] = fr.log_log_slope
+    for idx, color in zip(indices, colors):
+        vals = np.sort(np.abs(channel_data[:, idx]))[::-1]
+        vals = vals[vals > 0]
+        if len(vals) < 10:
+            continue
+        ranks = np.arange(1, len(vals) + 1)
+        step = max(1, len(ranks) // 3_000)
+        ax.loglog(ranks[::step], vals[::step], ".", markersize=1, alpha=0.5,
+                  color=color, label=f"ch {idx}")
 
-    fig, ax = plt.subplots(figsize=(max(8, len(layer_names) * 2), max(6, n_channels * 0.15)))
-    sns.heatmap(data, xticklabels=layer_names, cmap="coolwarm", center=0, ax=ax)
-    ax.set_title("Channel-wise Log-Log Slope by Layer", fontsize=14)
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("Sampled Channel Index")
+    ax.set_xlabel("Rank", fontsize=12)
+    ax.set_ylabel("Value", fontsize=12)
+    ax.set_title(f"Channel-wise rank-frequency: {layer_name}", fontsize=14)
+    ax.legend(fontsize=8, ncol=2, markerscale=5)
+    ax.grid(True, alpha=0.3)
 
     _save_fig(fig, output_path, config)
