@@ -1,0 +1,53 @@
+model:
+  name: "Qwen/Qwen3-4B-Base"
+  dtype: "bfloat16"
+  device_map: "auto"
+  trust_remote_code: true
+
+data:
+  name: "Skylion007/openwebtext"
+  split: "train"
+  streaming: true
+  max_tokens: 10000000
+  batch_size: 32
+  max_seq_len: 2048
+  num_workers: 0
+
+collection:
+  collection_points:
+    - "embed"
+    - "middle"
+    - "pre_last"
+  channel_sample_size: 64
+  channel_seed: 42
+
+statistics:
+  metrics:
+    - "channel_wise"
+    - "rms"
+    - "l2_norm"
+    - "l1_norm"
+    - "linf_norm"
+    - "variance"
+    - "kurtosis"
+    - "skewness"
+    - "entropy"
+    - "gini"
+    - "participation_ratio"
+    - "mean_abs"
+    - "max_value"
+    - "hoyer"
+
+fitting:
+  compare_distributions:
+    - "lognormal"
+    - "exponential"
+    - "truncated_power_law"
+  max_samples_for_fit: 1000000
+  fit_seed: 42
+
+output:
+  results_dir: "results"
+  plot_format: "pdf"
+  plot_dpi: 300
+  save_statistics: true

@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(head:*)",
+      "Bash(grep:*)",
+      "WebSearch",
+      "WebFetch(domain:medium.com)",
+      "Bash(tail:*)",
+      "Bash(git init:*)",
+      "Bash(source:*)",
+      "Bash(tee:*)"
+    ]
+  }
+}
