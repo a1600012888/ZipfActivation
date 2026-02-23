@@ -6,6 +6,9 @@ from typing import Optional
 
 from .config import StatisticsConfig, CollectionConfig
 
+# Shared RNG seed for reservoir sampling reproducibility
+_RESERVOIR_SEED = 12345
+
 
 # ---------------------------------------------------------------------------
 # Individual metric functions
@@ -151,6 +154,97 @@ class StatisticsAccumulator:
         for name, tensors in self.data.items():
             if tensors:
                 out[name] = torch.cat(tensors, dim=0).numpy()
+            else:
+                out[name] = np.array([])
+        return out
+
+
+class StreamingStatisticsAccumulator:
+    """Accumulates per-token statistics using reservoir sampling (Algorithm R).
+
+    Pre-allocates fixed-size numpy arrays and never stores more than
+    `reservoir_size` samples per metric, keeping memory bounded regardless
+    of how many tokens are processed.
+    """
+
+    def __init__(
+        self,
+        metrics: list[str],
+        hidden_dim: int,
+        collection_cfg: CollectionConfig,
+        reservoir_size: int = 1_000_000,
+    ):
+        self.metrics = metrics
+        self.hidden_dim = hidden_dim
+        self.reservoir_size = reservoir_size
+        self.rng = np.random.RandomState(_RESERVOIR_SEED)
+
+        # Determine channel_wise shape
+        k = min(collection_cfg.channel_sample_size, hidden_dim)
+        rng_ch = np.random.RandomState(collection_cfg.channel_seed)
+        self.channel_indices: list[int] = sorted(
+            rng_ch.choice(hidden_dim, size=k, replace=False).tolist()
+        )
+
+        # Pre-allocate reservoirs
+        self.reservoirs: dict[str, np.ndarray] = {}
+        self.total_seen: dict[str, int] = {}
+        for m in metrics:
+            if m == "channel_wise":
+                self.reservoirs[m] = np.empty((reservoir_size, k), dtype=np.float32)
+            else:
+                self.reservoirs[m] = np.empty(reservoir_size, dtype=np.float32)
+            self.total_seen[m] = 0
+
+    def _update_reservoir(self, name: str, new_values: np.ndarray) -> None:
+        """Vectorized reservoir sampling update (Algorithm R)."""
+        reservoir = self.reservoirs[name]
+        rs = self.reservoir_size
+        total = self.total_seen[name]
+        n = len(new_values)
+
+        if total + n <= rs:
+            # Still filling — copy directly
+            reservoir[total:total + n] = new_values
+        elif total < rs:
+            # Partially filling, partially sampling
+            fill = rs - total
+            reservoir[total:rs] = new_values[:fill]
+            # Remaining values need reservoir sampling
+            remaining = new_values[fill:]
+            m = len(remaining)
+            # For value at global position (rs + j), accept with prob rs/(rs+j+1)
+            positions = np.arange(rs, rs + m, dtype=np.int64)
+            rand_vals = self.rng.randint(0, positions + 1)
+            mask = rand_vals < rs
+            if mask.any():
+                reservoir[rand_vals[mask]] = remaining[mask]
+        else:
+            # Standard reservoir sampling: all values need probabilistic insert
+            positions = np.arange(total, total + n, dtype=np.int64)
+            rand_vals = self.rng.randint(0, positions + 1)
+            mask = rand_vals < rs
+            if mask.any():
+                reservoir[rand_vals[mask]] = new_values[mask]
+
+        self.total_seen[name] += n
+
+    def add_batch(self, flat: torch.Tensor) -> None:
+        """flat: [N, d] on GPU. Computes all metrics, does reservoir update."""
+        flat = flat.float()
+        for metric_name in self.metrics:
+            fn = METRIC_FUNCTIONS[metric_name]
+            values = fn(flat, channel_indices=self.channel_indices)
+            values_np = values.cpu().numpy()
+            self._update_reservoir(metric_name, values_np)
+
+    def finalize(self) -> dict[str, np.ndarray]:
+        """Return the filled portion of each reservoir."""
+        out = {}
+        for name in self.metrics:
+            filled = min(self.total_seen[name], self.reservoir_size)
+            if filled > 0:
+                out[name] = self.reservoirs[name][:filled].copy()
             else:
                 out[name] = np.array([])
         return out

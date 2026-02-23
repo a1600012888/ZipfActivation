@@ -4,10 +4,9 @@ Research toolkit for measuring hidden activations of pretrained LLMs and testing
 
 Given a pretrained language model and a text dataset, this pipeline:
 
-1. Inserts hook-based feature collectors at configurable layers (embedding, middle, pre-last, or any explicit layer index)
-2. Streams tokens through the model, computing scalar statistics from each token's d-dimensional activation vector on-the-fly (never storing full activations)
-3. Fits power law distributions to the resulting N-length statistic arrays using both the Clauset et al. method and log-log linear regression
-4. Generates diagnostic plots: rank-frequency, CCDF, multi-layer comparisons, and heatmap dashboards
+1. Inserts hook-based feature collectors at configurable layers (embedding, first, middle, last, or any explicit layer index)
+2. Streams tokens through the model, computing scalar statistics from each token's d-dimensional activation vector on-the-fly using reservoir sampling (never storing full activations)
+3. Generates diagnostic plots at multiple trim levels: rank-frequency, histograms, multi-layer comparisons, and channel-wise overlays
 
 ## Project Structure
 
@@ -22,18 +21,17 @@ ZipfActivation/
 │   ├── config.py               # Dataclass configs + YAML/CLI loading
 │   ├── data.py                 # Streaming dataset with token packing (no padding waste)
 │   ├── model.py                # Model loading, hook registration, ActivationCollector
-│   ├── statistics.py           # 14 metric functions + StatisticsAccumulator
-│   ├── fitting.py              # Power law fitting (powerlaw pkg + log-log OLS)
-│   ├── visualization.py        # 6 plot types (rank-freq, CCDF, comparison, dashboards, heatmap)
+│   ├── statistics.py           # 14 metric functions + StreamingStatisticsAccumulator
+│   ├── visualization.py        # Plot types: rank-frequency, histogram, multi-layer, channel overlays
 │   └── pipeline.py             # End-to-end orchestration
 ├── requirements.txt
 └── results/                    # Created at runtime (gitignored)
-    ├── statistics/             # Per-layer .npz files with all metric arrays
-    ├── fits/                   # fit_results.json with all power law fit parameters
-    └── plots/                  # All generated plots
+    └── plots/
         ├── rank_frequency/
-        ├── ccdf/
-        └── multi_layer/
+        ├── histogram/
+        ├── multi_layer/
+        ├── channel_rank_frequency/
+        └── channel_histogram/
 ```
 
 ## Setup
@@ -54,7 +52,7 @@ Requires Python 3.10+ and a CUDA-capable GPU.
 python scripts/run.py --config configs/default.yaml
 ```
 
-This runs Qwen3-4B-Base on OpenWebText (10M tokens) with 3 collection points and all 14 metrics.
+This runs Qwen3-4B-Base on OpenWebText (10M tokens) with 4 collection points (embed, first, middle, last) and all 14 metrics.
 
 ### Quick smoke test
 
@@ -69,6 +67,18 @@ python scripts/run.py \
     --output.plot_format png
 ```
 
+### Adding explicit layers
+
+Use `--layers` to add specific layer indices on top of the default collection points:
+
+```bash
+python scripts/run.py \
+    --config configs/default.yaml \
+    --layers 5,10,20
+```
+
+This collects from embed + first + middle + last + layers 5, 10, and 20.
+
 ### CLI options
 
 | Flag | Description |
@@ -82,6 +92,7 @@ python scripts/run.py \
 | `--data.max_seq_len` | Sequence length for token packing |
 | `--output.results_dir` | Output directory for results |
 | `--output.plot_format` | Plot format: `pdf`, `png`, or `both` |
+| `--layers` | Comma-separated layer indices to add (e.g. `5,10,20`) |
 
 CLI flags override the YAML config values.
 
@@ -102,18 +113,19 @@ All settings are in `configs/default.yaml`. Key sections:
 ### Collection Points
 Symbolic names resolved at runtime:
 - `"embed"` — after the embedding layer
+- `"first"` — first decoder layer (layer 0)
 - `"middle"` — layer at `num_layers // 2`
-- `"pre_last"` — second-to-last layer
+- `"last"` — final decoder layer
 - `"layer_N"` — explicit layer index N
 
-Or set `explicit_layers: [0, 5, 10, 15, 20, 25]` for arbitrary layer indices.
+The `--layers` CLI flag adds extra layers on top of the symbolic defaults (it does not replace them).
 
 ### Metrics (14 total)
 Each metric reduces a d-dimensional activation vector to a scalar, yielding an N-length distribution across tokens:
 
 | Metric | Description |
 |--------|-------------|
-| `channel_wise` | Raw values for k sampled channels (fit per-channel) |
+| `channel_wise` | Raw values for k sampled channels (plotted per-channel) |
 | `rms` | Root mean square |
 | `l2_norm` | L2 (Euclidean) norm |
 | `l1_norm` | L1 (Manhattan) norm |
@@ -128,39 +140,54 @@ Each metric reduces a d-dimensional activation vector to a scalar, yielding an N
 | `max_value` | Maximum value |
 | `hoyer` | Hoyer sparsity measure |
 
-### Fitting
-- **Clauset method** (via `powerlaw` package): estimates alpha, xmin via KS statistic minimization
-- **Log-log OLS**: fast linear regression on log(rank) vs log(value)
-- **Distribution comparisons**: power law vs lognormal, exponential, truncated power law (likelihood ratio tests)
-- Subsampled to `max_samples_for_fit` (default 50K) for performance
-
 ## Output
 
-### Statistics (`results/statistics/`)
-Per-layer `.npz` files containing numpy arrays for each metric. Load with:
-```python
-data = np.load("results/statistics/layer_14.npz")
-rms_values = data["rms"]  # shape: [N]
-channel_values = data["channel_wise"]  # shape: [N, k]
+All output goes to `results/plots/` (configurable via `--output.results_dir`). Every plot type is generated at four trim levels:
+
+| Trim Level | Meaning |
+|------------|---------|
+| `full` | All data points |
+| `trim1` | Remove bottom 1% and top 1% (keep middle 98%) |
+| `trim5` | Remove bottom 5% and top 5% (keep middle 90%) |
+| `trim10` | Remove bottom 10% and top 10% (keep middle 80%) |
+
+### Plot types
+
+```
+results/plots/
+├── rank_frequency/               # Log-log rank vs value
+│   ├── {layer}_{metric}_full.png
+│   ├── {layer}_{metric}_trim1.png
+│   ├── {layer}_{metric}_trim5.png
+│   └── {layer}_{metric}_trim10.png
+├── histogram/                    # Value distribution histogram
+│   ├── {layer}_{metric}_full.png
+│   ├── ...
+├── multi_layer/                  # All layers overlaid per metric
+│   ├── comparison_{metric}_full.png
+│   ├── ...
+├── channel_rank_frequency/       # Sampled channels overlaid per layer
+│   ├── {layer}_channels_full.png
+│   ├── ...
+└── channel_histogram/            # Channel histograms overlaid per layer
+    ├── {layer}_channels_full.png
+    └── ...
 ```
 
-### Fit Results (`results/fits/fit_results.json`)
-JSON with per-layer, per-metric fit parameters: alpha, xmin, sigma, KS statistic, distribution comparison results, log-log slope/intercept/R^2.
-
-### Plots (`results/plots/`)
-- `rank_frequency/` — log-log rank vs value with fit line overlay (per layer, per metric)
-- `ccdf/` — complementary CDF with all fit statistics annotated
-- `multi_layer/` — overlay of all layers for each metric
-- `alpha_dashboard` — heatmap of power law exponents across layers and metrics
-- `slope_dashboard` — heatmap of log-log slopes
-- `channel_heatmap` — heatmap of per-channel slopes across layers
+With default settings (4 layers, 13 scalar metrics, 4 trims), this produces:
+- 208 rank-frequency plots
+- 208 histogram plots
+- 52 multi-layer comparison plots
+- 16 channel rank-frequency plots
+- 16 channel histogram plots
+- **500 plots total**
 
 ## Memory Efficiency
 
-The pipeline never stores full activation tensors. Each forward hook computes scalar reductions on GPU immediately and moves only the reduced values to CPU. For 10M tokens with 14 metrics, total CPU accumulator memory is ~560 MB.
+The pipeline never stores full activation tensors. Each forward hook computes scalar reductions on GPU immediately and uses reservoir sampling (Algorithm R) to maintain a bounded-size sample per metric. Memory usage is fixed regardless of how many tokens are processed — controlled by `reservoir_size` (default 1M samples per metric per layer).
 
 ## Known Issues
 
-- `powerlaw` 2.0.0 has a bug in `KS()` (NameError on `compute_distance_metrics`). The code includes a workaround using scipy's KS test as fallback.
-- `powerlaw.Fit()` is slow (~1 minute per fit on 50K samples). Channel-wise fits use a reduced sample size (10K) to keep total time manageable.
-- The Clauset method often saturates at alpha=3.0 for concentrated distributions — check the log-log slope and R^2 for a complementary view.
+- `torch_dtype` is deprecated in transformers 5.2 — the code uses `dtype=` instead.
+- `wikitext` dataset requires the `subset` parameter (e.g. `--data.subset wikitext-2-raw-v1`).
+- There is no "Qwen3-3B". Available Qwen3 base models: 0.6B, 1.7B, 4B, 8B, 14B, 32B.

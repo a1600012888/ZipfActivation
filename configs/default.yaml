@@ -16,8 +16,9 @@ data:
 collection:
   collection_points:
     - "embed"
+    - "first"
     - "middle"
-    - "pre_last"
+    - "last"
   channel_sample_size: 64
   channel_seed: 42
 
@@ -38,16 +39,7 @@ statistics:
     - "max_value"
     - "hoyer"
 
-fitting:
-  compare_distributions:
-    - "lognormal"
-    - "exponential"
-    - "truncated_power_law"
-  max_samples_for_fit: 1000000
-  fit_seed: 42
-
 output:
   results_dir: "results"
   plot_format: "pdf"
   plot_dpi: 300
-  save_statistics: true

@@ -5,7 +5,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 from .config import ModelConfig, CollectionConfig, StatisticsConfig
-from .statistics import StatisticsAccumulator
+from .statistics import StreamingStatisticsAccumulator
 
 
 def load_model(config: ModelConfig) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
@@ -62,19 +62,17 @@ def _resolve_collection_points(
 
     name_to_module: dict[str, nn.Module] = {}
 
-    # Handle explicit layer indices
-    if config.explicit_layers:
-        for idx in config.explicit_layers:
-            name_to_module[f"layer_{idx}"] = layers[idx]
-        return name_to_module
-
     # Handle symbolic names
     for point in config.collection_points:
         if point == "embed":
             name_to_module["embed"] = _get_embedding_module(base)
+        elif point == "first":
+            name_to_module["layer_0"] = layers[0]
         elif point == "middle":
             mid = num_layers // 2
             name_to_module[f"layer_{mid}"] = layers[mid]
+        elif point == "last":
+            name_to_module[f"layer_{num_layers - 1}"] = layers[num_layers - 1]
         elif point == "pre_last":
             name_to_module[f"layer_{num_layers - 2}"] = layers[num_layers - 2]
         elif point.startswith("layer_"):
@@ -82,6 +80,13 @@ def _resolve_collection_points(
             name_to_module[point] = layers[idx]
         else:
             raise ValueError(f"Unknown collection point: {point}")
+
+    # Merge explicit layer indices (additive, don't replace symbolic points)
+    if config.explicit_layers:
+        for idx in config.explicit_layers:
+            key = f"layer_{idx}"
+            if key not in name_to_module:
+                name_to_module[key] = layers[idx]
 
     return name_to_module
 
@@ -99,16 +104,17 @@ class ActivationCollector:
     ):
         self.model = model
         self.hooks: list[torch.utils.hooks.RemovableHook] = []
-        self.accumulators: dict[str, StatisticsAccumulator] = {}
+        self.accumulators: dict[str, StreamingStatisticsAccumulator] = {}
 
         layer_map = _resolve_collection_points(model, collection_cfg)
         hidden_dim = model.config.hidden_size
 
         for name, module in layer_map.items():
-            acc = StatisticsAccumulator(
+            acc = StreamingStatisticsAccumulator(
                 metrics=stats_cfg.metrics,
                 hidden_dim=hidden_dim,
                 collection_cfg=collection_cfg,
+                reservoir_size=collection_cfg.reservoir_size,
             )
             self.accumulators[name] = acc
             handle = module.register_forward_hook(self._make_hook(name))

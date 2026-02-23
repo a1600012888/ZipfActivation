@@ -30,11 +30,12 @@ class DataConfig:
 @dataclass
 class CollectionConfig:
     collection_points: list[str] = field(
-        default_factory=lambda: ["embed", "middle", "pre_last"]
+        default_factory=lambda: ["embed", "first", "middle", "last"]
     )
     explicit_layers: Optional[list[int]] = None
     channel_sample_size: int = 64
     channel_seed: int = 42
+    reservoir_size: int = 1_000_000
 
 
 @dataclass
@@ -60,20 +61,10 @@ class StatisticsConfig:
 
 
 @dataclass
-class FittingConfig:
-    compare_distributions: list[str] = field(
-        default_factory=lambda: ["lognormal", "exponential", "truncated_power_law"]
-    )
-    max_samples_for_fit: int = 50_000
-    fit_seed: int = 42
-
-
-@dataclass
 class OutputConfig:
     results_dir: str = "results"
     plot_format: str = "pdf"
     plot_dpi: int = 300
-    save_statistics: bool = True
 
 
 @dataclass
@@ -82,7 +73,6 @@ class ZipfActivationConfig:
     data: DataConfig = field(default_factory=DataConfig)
     collection: CollectionConfig = field(default_factory=CollectionConfig)
     statistics: StatisticsConfig = field(default_factory=StatisticsConfig)
-    fitting: FittingConfig = field(default_factory=FittingConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
 
@@ -91,7 +81,7 @@ def _apply_dict(dc: object, d: dict) -> None:
         if hasattr(dc, k):
             attr = getattr(dc, k)
             if isinstance(attr, (ModelConfig, DataConfig, CollectionConfig,
-                                 StatisticsConfig, FittingConfig, OutputConfig)):
+                                 StatisticsConfig, OutputConfig)):
                 _apply_dict(attr, v)
             else:
                 setattr(dc, k, v)
@@ -119,6 +109,8 @@ def config_from_cli() -> ZipfActivationConfig:
     parser.add_argument("--data.max_seq_len", dest="data_max_seq_len", type=int, default=None)
     parser.add_argument("--output.results_dir", dest="output_results_dir", type=str, default=None)
     parser.add_argument("--output.plot_format", dest="output_plot_format", type=str, default=None)
+    parser.add_argument("--layers", type=str, default=None,
+                        help="Comma-separated layer indices to add (e.g. --layers 5,10,20)")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -144,5 +136,10 @@ def config_from_cli() -> ZipfActivationConfig:
 
     if overrides:
         _apply_dict(cfg, overrides)
+
+    # Parse --layers into explicit_layers (additive to symbolic collection_points)
+    if args.layers:
+        layer_indices = [int(x.strip()) for x in args.layers.split(",")]
+        cfg.collection.explicit_layers = layer_indices
 
     return cfg
